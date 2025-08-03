@@ -1,0 +1,637 @@
+# =============================================================================
+# PHASE 2: FILE DISCOVERY AND FILTERING
+# =============================================================================
+
+# Cell 1: Markdown Explanation
+"""
+## Phase 2: File Discovery and Filtering
+
+This phase implements comprehensive file discovery and filtering functionality for the code chunking system. 
+
+### Key Features:
+- **Extension-based filtering**: Only processes files with specified extensions (.tsx, .ts, .js, .jsx, .html, .css, .scss)
+- **Gitignore support**: Handles both root and nested .gitignore files when present
+- **Symbolic link handling**: Skips symbolic links to avoid potential infinite loops
+- **Binary file detection**: Automatically skips binary files using null byte detection
+- **Progress tracking**: Shows real-time progress with file counts and percentages
+- **Robust error handling**: Collects and reports all errors without stopping processing
+
+### Processing Flow:
+1. Scan for .gitignore files (root and nested)
+2. Recursively discover all files in target directory
+3. Apply extension filtering (strict - only specified extensions)
+4. Apply .gitignore exclusions (when files are present)
+5. Apply additional user-defined exclusions
+6. Validate file accessibility and content type
+7. Generate FileMetadata objects for valid files
+
+### Error Handling:
+- Permission denied errors are collected but don't stop processing
+- Binary files are automatically skipped
+- Empty files are filtered out
+- Inaccessible files are logged but processing continues
+
+This implementation is designed to handle the scenario where source folders are copied into TARGET_DIRECTORY, with or without .gitignore files.
+"""
+
+# Cell 2: Core Imports and Utilities for File Discovery
+import os
+import mimetypes
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple, Set
+from dataclasses import dataclass, field
+import pathspec
+import logging
+import time
+
+# Initialize progress tracking variables
+_discovery_start_time = None
+_total_files_found = 0
+_current_file_count = 0
+
+def setup_progress_tracking():
+    """Initialize progress tracking for file discovery"""
+    global _discovery_start_time, _total_files_found, _current_file_count
+    _discovery_start_time = time.time()
+    _total_files_found = 0
+    _current_file_count = 0
+
+def log_progress(current: int, total: int, current_file: str = "", stage: str = "Processing"):
+    """
+    Log progress with percentage, count, and current file information.
+    
+    Args:
+        current: Current item number
+        total: Total items to process
+        current_file: Current file being processed (optional)
+        stage: Stage description (default: "Processing")
+    """
+    if total == 0:
+        percentage = 0
+    else:
+        percentage = (current / total) * 100
+    
+    elapsed = time.time() - _discovery_start_time if _discovery_start_time else 0
+    
+    file_info = f" | Current: {current_file}" if current_file else ""
+    print(f"\r{stage}: {current:,}/{total:,} ({percentage:.1f}%) | Elapsed: {elapsed:.1f}s{file_info}", end="", flush=True)
+    
+    # Print newline every 50 files or at completion to avoid overwhelming output
+    if current % 50 == 0 or current == total:
+        print()
+
+# Cell 3: Binary File Detection and Validation
+def is_binary_file(file_path: Path) -> bool:
+    """
+    Detect if file is binary by checking for null bytes in first 1024 bytes.
+    
+    Args:
+        file_path: Path to the file to check
+        
+    Returns:
+        True if file appears to be binary, False otherwise
+    """
+    try:
+        with open(file_path, 'rb') as file:
+            chunk = file.read(1024)
+            return b'\x00' in chunk
+    except (IOError, OSError, PermissionError):
+        # If we can't read the file, assume it's problematic and skip it
+        return True
+
+def is_empty_file(file_path: Path) -> bool:
+    """
+    Check if file is empty or contains only whitespace.
+    
+    Args:
+        file_path: Path to the file to check
+        
+    Returns:
+        True if file is empty or whitespace-only, False otherwise
+    """
+    try:
+        if file_path.stat().st_size == 0:
+            return True
+        
+        # Check if file contains only whitespace
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as file:
+            content = file.read().strip()
+            return len(content) == 0
+    except (IOError, OSError, PermissionError, UnicodeDecodeError):
+        return True
+
+def validate_file_processable(file_path: Path) -> Tuple[bool, str]:
+    """
+    Validate if file can be processed (not binary, not empty, accessible).
+    
+    Args:
+        file_path: Path to the file
+        
+    Returns:
+        Tuple of (is_processable: bool, reason: str)
+    """
+    try:
+        # Check if file exists and is accessible
+        if not file_path.exists():
+            return False, "File does not exist"
+        
+        if not file_path.is_file():
+            return False, "Not a regular file"
+        
+        # Check if it's a symbolic link (skip if configured to)
+        if file_path.is_symlink():
+            return False, "Symbolic link (skipped)"
+        
+        # Check if file is empty
+        if is_empty_file(file_path):
+            return False, "Empty file or whitespace-only"
+        
+        # Check if file is binary
+        if is_binary_file(file_path):
+            return False, "Binary file"
+        
+        # Check file permissions
+        if not os.access(file_path, os.R_OK):
+            return False, "Permission denied"
+        
+        return True, "Valid"
+        
+    except Exception as e:
+        return False, f"Validation error: {str(e)}"
+
+# Cell 4: Gitignore Processing Functions
+def find_gitignore_files(directory: Path) -> List[Path]:
+    """
+    Find all .gitignore files in directory tree (root and nested).
+    
+    Args:
+        directory: Root directory to search in
+        
+    Returns:
+        List of paths to .gitignore files found
+    """
+    gitignore_files = []
+    
+    try:
+        for root, dirs, files in os.walk(directory):
+            # Skip .git directories
+            dirs[:] = [d for d in dirs if d != '.git']
+            
+            root_path = Path(root)
+            if '.gitignore' in files:
+                gitignore_path = root_path / '.gitignore'
+                if gitignore_path.is_file():
+                    gitignore_files.append(gitignore_path)
+                    
+    except (OSError, PermissionError) as e:
+        logging.warning(f"Error scanning for .gitignore files: {e}")
+    
+    return gitignore_files
+
+def load_gitignore_patterns(gitignore_files: List[Path], project_root: Path) -> Optional[pathspec.PathSpec]:
+    """
+    Load and parse patterns from multiple .gitignore files.
+    
+    Args:
+        gitignore_files: List of .gitignore file paths
+        project_root: Root directory of the project
+        
+    Returns:
+        PathSpec object for combined .gitignore patterns or None if no valid files
+    """
+    if not gitignore_files:
+        return None
+    
+    all_patterns = []
+    
+    for gitignore_path in gitignore_files:
+        try:
+            with open(gitignore_path, 'r', encoding='utf-8', errors='ignore') as f:
+                patterns = f.readlines()
+                
+            # Add relative path prefix for nested .gitignore files
+            if gitignore_path.parent != project_root:
+                rel_prefix = gitignore_path.parent.relative_to(project_root)
+                prefixed_patterns = []
+                for pattern in patterns:
+                    pattern = pattern.strip()
+                    if pattern and not pattern.startswith('#'):
+                        # Add the relative path as prefix
+                        prefixed_pattern = str(rel_prefix / pattern)
+                        prefixed_patterns.append(prefixed_pattern)
+                all_patterns.extend(prefixed_patterns)
+            else:
+                all_patterns.extend(patterns)
+                
+        except (IOError, OSError, UnicodeDecodeError) as e:
+            logging.warning(f"Error reading .gitignore file {gitignore_path}: {e}")
+    
+    if not all_patterns:
+        return None
+    
+    try:
+        return pathspec.PathSpec.from_lines('gitwildmatch', all_patterns)
+    except Exception as e:
+        logging.warning(f"Error parsing .gitignore patterns: {e}")
+        return None
+
+# Cell 5: File Exclusion Logic
+def create_additional_exclusion_spec(additional_exclusions: List[str]) -> pathspec.PathSpec:
+    """
+    Create PathSpec for additional user-defined exclusions.
+    
+    Args:
+        additional_exclusions: List of additional exclusion patterns
+        
+    Returns:
+        PathSpec object for additional exclusions
+    """
+    if not additional_exclusions:
+        return pathspec.PathSpec.from_lines('gitwildmatch', [])
+    
+    return pathspec.PathSpec.from_lines('gitwildmatch', additional_exclusions)
+
+def is_file_excluded(file_path: Path, 
+                    gitignore_spec: Optional[pathspec.PathSpec],
+                    additional_exclusions_spec: pathspec.PathSpec,
+                    project_root: Path) -> Tuple[bool, str]:
+    """
+    Check if file should be excluded from processing.
+    
+    Args:
+        file_path: Path to the file
+        gitignore_spec: .gitignore PathSpec object (can be None)
+        additional_exclusions_spec: Additional exclusions PathSpec
+        project_root: Project root directory
+        
+    Returns:
+        Tuple of (is_excluded: bool, reason: str)
+    """
+    try:
+        # Get relative path for pattern matching
+        rel_path = file_path.relative_to(project_root)
+        rel_path_str = str(rel_path).replace('\\', '/')  # Normalize for cross-platform
+        
+        # Check additional exclusions first
+        if additional_exclusions_spec.match_file(rel_path_str):
+            return True, "Additional exclusion pattern"
+        
+        # Check .gitignore patterns if available
+        if gitignore_spec and gitignore_spec.match_file(rel_path_str):
+            return True, ".gitignore pattern"
+        
+        return False, "Not excluded"
+        
+    except ValueError:
+        # File is not under project_root
+        return True, "Outside project root"
+    except Exception as e:
+        logging.warning(f"Error checking exclusion for {file_path}: {e}")
+        return False, "Exclusion check failed"
+
+# Cell 6: File Metadata Generation
+@dataclass
+class FileMetadata:
+    """Metadata for a source file"""
+    file_path: Path
+    relative_path: str
+    extension: str
+    size_bytes: int
+    total_lines: int
+    import_lines: int = 0  # Will be calculated later in AST analysis
+    has_package_json: bool = False
+
+def count_file_lines(file_path: Path) -> int:
+    """
+    Count total lines in a file.
+    
+    Args:
+        file_path: Path to the file
+        
+    Returns:
+        Number of lines in the file
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            return sum(1 for _ in f)
+    except (IOError, OSError, UnicodeDecodeError):
+        return 0
+
+def create_file_metadata(file_path: Path, project_root: Path) -> Optional[FileMetadata]:
+    """
+    Create FileMetadata object for a valid file.
+    
+    Args:
+        file_path: Path to the file
+        project_root: Project root directory
+        
+    Returns:
+        FileMetadata object or None if file cannot be processed
+    """
+    try:
+        # Get relative path
+        relative_path = file_path.relative_to(project_root)
+        relative_path_str = str(relative_path).replace('\\', '/')
+        
+        # Get file stats
+        stat_info = file_path.stat()
+        file_size = stat_info.st_size
+        
+        # Count lines
+        line_count = count_file_lines(file_path)
+        
+        return FileMetadata(
+            file_path=file_path,
+            relative_path=relative_path_str,
+            extension=file_path.suffix.lower(),
+            size_bytes=file_size,
+            total_lines=line_count
+        )
+        
+    except Exception as e:
+        logging.warning(f"Error creating metadata for {file_path}: {e}")
+        return None
+
+# Cell 7: Main File Discovery Function
+def discover_files(target_directory: Path,
+                  supported_extensions: List[str],
+                  additional_exclusions: List[str]) -> Tuple[List[FileMetadata], List[str]]:
+    """
+    Discover all processable files in target directory.
+    
+    Args:
+        target_directory: Directory to scan recursively
+        supported_extensions: List of supported file extensions
+        additional_exclusions: Additional files/patterns to exclude
+        
+    Returns:
+        Tuple of (file_metadata_list, error_messages)
+    """
+    logger = logging.getLogger(__name__)
+    setup_progress_tracking()
+    
+    print(f"Starting file discovery in: {target_directory}")
+    print(f"Supported extensions: {', '.join(supported_extensions)}")
+    print(f"Additional exclusions: {len(additional_exclusions)} patterns")
+    
+    # Initialize tracking variables
+    discovered_files = []
+    error_messages = []
+    all_discovered_paths = []
+    
+    # Phase 1: Find .gitignore files
+    print("\n=== Phase 1: Scanning for .gitignore files ===")
+    gitignore_files = find_gitignore_files(target_directory)
+    gitignore_spec = load_gitignore_patterns(gitignore_files, target_directory)
+    
+    if gitignore_files:
+        print(f"Found {len(gitignore_files)} .gitignore file(s):")
+        for gf in gitignore_files:
+            rel_path = gf.relative_to(target_directory)
+            print(f"  - {rel_path}")
+    else:
+        print("No .gitignore files found")
+    
+    # Create additional exclusions spec
+    additional_exclusions_spec = create_additional_exclusion_spec(additional_exclusions)
+    
+    # Phase 2: Discover all files with supported extensions
+    print("\n=== Phase 2: Discovering files by extension ===")
+    
+    try:
+        for root, dirs, files in os.walk(target_directory):
+            # Skip .git directories
+            dirs[:] = [d for d in dirs if d != '.git']
+            
+            root_path = Path(root)
+            
+            for file_name in files:
+                file_path = root_path / file_name
+                
+                # Check if file has supported extension
+                file_extension = file_path.suffix.lower()
+                if file_extension in supported_extensions:
+                    all_discovered_paths.append(file_path)
+                    
+    except (OSError, PermissionError) as e:
+        error_msg = f"Error during file discovery: {e}"
+        error_messages.append(error_msg)
+        logger.error(error_msg)
+    
+    total_discovered = len(all_discovered_paths)
+    print(f"Found {total_discovered:,} files with supported extensions")
+    
+    if total_discovered == 0:
+        print("No files found with supported extensions!")
+        return [], error_messages
+    
+    # Phase 3: Filter and validate files
+    print("\n=== Phase 3: Filtering and validating files ===")
+    
+    stats = {
+        'total_found': total_discovered,
+        'excluded_gitignore': 0,
+        'excluded_additional': 0,
+        'excluded_validation': 0,
+        'valid_files': 0
+    }
+    
+    for i, file_path in enumerate(all_discovered_paths, 1):
+        log_progress(i, total_discovered, file_path.name, "Validating")
+        
+        try:
+            # Check exclusions
+            is_excluded, exclusion_reason = is_file_excluded(
+                file_path, gitignore_spec, additional_exclusions_spec, target_directory
+            )
+            
+            if is_excluded:
+                if "gitignore" in exclusion_reason.lower():
+                    stats['excluded_gitignore'] += 1
+                else:
+                    stats['excluded_additional'] += 1
+                continue
+            
+            # Validate file
+            is_valid, validation_reason = validate_file_processable(file_path)
+            
+            if not is_valid:
+                stats['excluded_validation'] += 1
+                if "Permission denied" in validation_reason or "error" in validation_reason.lower():
+                    error_msg = f"File validation error for {file_path}: {validation_reason}"
+                    error_messages.append(error_msg)
+                continue
+            
+            # Create metadata for valid file
+            metadata = create_file_metadata(file_path, target_directory)
+            if metadata:
+                discovered_files.append(metadata)
+                stats['valid_files'] += 1
+            else:
+                stats['excluded_validation'] += 1
+                error_msg = f"Failed to create metadata for {file_path}"
+                error_messages.append(error_msg)
+                
+        except Exception as e:
+            error_msg = f"Unexpected error processing {file_path}: {e}"
+            error_messages.append(error_msg)
+            logger.error(error_msg)
+    
+    # Final progress update
+    log_progress(total_discovered, total_discovered, "", "Validation complete")
+    
+    # Print summary
+    print(f"\n=== File Discovery Summary ===")
+    print(f"Total files found: {stats['total_found']:,}")
+    print(f"Excluded by .gitignore: {stats['excluded_gitignore']:,}")
+    print(f"Excluded by additional patterns: {stats['excluded_additional']:,}")
+    print(f"Excluded by validation: {stats['excluded_validation']:,}")
+    print(f"Valid files for processing: {stats['valid_files']:,}")
+    
+    if error_messages:
+        print(f"\nErrors encountered: {len(error_messages)}")
+        print("First 5 errors:")
+        for error in error_messages[:5]:
+            print(f"  - {error}")
+        if len(error_messages) > 5:
+            print(f"  ... and {len(error_messages) - 5} more errors")
+    
+    elapsed_time = time.time() - _discovery_start_time
+    print(f"\nFile discovery completed in {elapsed_time:.2f} seconds")
+    
+    return discovered_files, error_messages
+
+# Cell 8: File Discovery Testing and Validation
+def test_file_discovery(target_directory: Path, 
+                       supported_extensions: List[str],
+                       additional_exclusions: List[str]) -> None:
+    """
+    Test the file discovery functionality with detailed reporting.
+    
+    Args:
+        target_directory: Directory to test discovery on
+        supported_extensions: Extensions to look for
+        additional_exclusions: Additional exclusion patterns
+    """
+    print("=== TESTING FILE DISCOVERY SYSTEM ===\n")
+    
+    # Test directory existence
+    if not target_directory.exists():
+        print(f"❌ ERROR: Target directory does not exist: {target_directory}")
+        return
+    
+    if not target_directory.is_dir():
+        print(f"❌ ERROR: Target path is not a directory: {target_directory}")
+        return
+    
+    print(f"✅ Target directory exists: {target_directory}")
+    
+    # Run discovery
+    try:
+        files, errors = discover_files(target_directory, supported_extensions, additional_exclusions)
+        
+        print(f"\n=== DISCOVERY RESULTS ===")
+        print(f"Successfully discovered: {len(files)} files")
+        print(f"Errors encountered: {len(errors)}")
+        
+        if files:
+            print(f"\n=== SAMPLE FILES (first 10) ===")
+            for i, file_meta in enumerate(files[:10]):
+                print(f"{i+1:2d}. {file_meta.relative_path}")
+                print(f"     Size: {file_meta.size_bytes:,} bytes, Lines: {file_meta.total_lines:,}")
+            
+            if len(files) > 10:
+                print(f"     ... and {len(files) - 10} more files")
+        
+        # Extension breakdown
+        ext_counts = {}
+        for file_meta in files:
+            ext = file_meta.extension
+            ext_counts[ext] = ext_counts.get(ext, 0) + 1
+        
+        if ext_counts:
+            print(f"\n=== FILES BY EXTENSION ===")
+            for ext in sorted(ext_counts.keys()):
+                print(f"  {ext}: {ext_counts[ext]:,} files")
+        
+    except Exception as e:
+        print(f"❌ CRITICAL ERROR during file discovery: {e}")
+        import traceback
+        traceback.print_exc()
+
+# Cell 9: Example Usage and Integration Test
+def run_file_discovery_example():
+    """
+    Example function showing how to use the file discovery system.
+    This can be called to test the implementation.
+    """
+    print("=== FILE DISCOVERY EXAMPLE ===\n")
+    
+    # Use configuration from Phase 1
+    target_dir = Path(TARGET_DIRECTORY)
+    supported_exts = SUPPORTED_EXTENSIONS
+    additional_excl = ADDITIONAL_EXCLUSIONS
+    
+    print(f"Configuration:")
+    print(f"  Target Directory: {target_dir}")
+    print(f"  Supported Extensions: {supported_exts}")
+    print(f"  Additional Exclusions: {len(additional_excl)} patterns")
+    
+    # Test the discovery system
+    test_file_discovery(target_dir, supported_exts, additional_excl)
+    
+    return True
+
+# Cell 10: Integration with Main Pipeline
+def phase2_discover_files(target_directory: Path,
+                         supported_extensions: List[str],
+                         additional_exclusions: List[str]) -> Tuple[List[FileMetadata], List[str]]:
+    """
+    Main entry point for Phase 2: File Discovery and Filtering.
+    This function will be called from the main ChunkingPipeline.
+    
+    Args:
+        target_directory: Directory to scan for files
+        supported_extensions: List of file extensions to process
+        additional_exclusions: Additional exclusion patterns
+        
+    Returns:
+        Tuple of (discovered_files, error_messages)
+    """
+    logger = logging.getLogger(__name__)
+    logger.info("Starting Phase 2: File Discovery and Filtering")
+    
+    try:
+        # Validate inputs
+        if not target_directory.exists():
+            raise ValueError(f"Target directory does not exist: {target_directory}")
+        
+        if not supported_extensions:
+            raise ValueError("No supported extensions specified")
+        
+        # Normalize extensions to ensure they start with dot
+        normalized_extensions = []
+        for ext in supported_extensions:
+            if not ext.startswith('.'):
+                ext = '.' + ext
+            normalized_extensions.append(ext.lower())
+        
+        # Run file discovery
+        files, errors = discover_files(target_directory, normalized_extensions, additional_exclusions)
+        
+        logger.info(f"Phase 2 completed: {len(files)} files discovered, {len(errors)} errors")
+        
+        return files, errors
+        
+    except Exception as e:
+        error_msg = f"Phase 2 failed: {e}"
+        logger.error(error_msg)
+        return [], [error_msg]
+
+print("✅ Phase 2: File Discovery and Filtering - Implementation Complete")
+print("\nAvailable functions:")
+print("  - discover_files(): Main file discovery function")
+print("  - test_file_discovery(): Test the discovery system")
+print("  - run_file_discovery_example(): Example usage")
+print("  - phase2_discover_files(): Integration entry point")
+print("\nReady for testing with: run_file_discovery_example()")
