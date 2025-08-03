@@ -1,0 +1,12 @@
+# Ignore everything
+*
+
+# But not these!
+!.gitignore
+!scripts/
+!scripts/**
+
+# Explicitly ignore unwanted directories even if matched by override
+env/
+rag_sources/
+rag_chunks/
